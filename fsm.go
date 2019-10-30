@@ -58,7 +58,7 @@ func makeError(name string, s int, e Event, msg string) *Error {
 }
 
 type FSM struct {
-	sync.Mutex
+	sync.Locker
 	rwLocker    sync.RWMutex
 	flag        uint32
 	name        string
@@ -161,6 +161,7 @@ func (f *FSM) getTransition(e Event) (t *Transition, ok bool) {
 type Builder struct {
 	err         error
 	name        string
+	locker      sync.Locker
 	initState   *State
 	stateMap    map[int]*State
 	transitions []*Transition
@@ -178,6 +179,11 @@ func (b *Builder) Name(name string) *Builder {
 		return b
 	}
 	b.name = name
+	return b
+}
+
+func (b *Builder) WithLocker(locker sync.Locker) *Builder {
+	b.locker = locker
 	return b
 }
 
@@ -241,6 +247,12 @@ func (b *Builder) Build() (*FSM, error) {
 	}
 	if f.name == "" {
 		f.name = fmt.Sprintf("%p", f)
+	}
+
+	if b.locker != nil {
+		f.Locker = b.locker
+	} else {
+		f.Locker = &sync.Mutex{}
 	}
 
 	return f, nil
