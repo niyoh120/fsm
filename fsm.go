@@ -1,18 +1,15 @@
+// Simple Finite State Machine for Go
 package fsm
 
 import (
 	"errors"
 	"fmt"
-	"log"
 	"sync"
 	"sync/atomic"
 )
 
-var (
-	Debug = false
-)
-
 type Event int
+
 type TransMap map[int]int
 
 type Transition struct {
@@ -58,21 +55,56 @@ func makeError(name string, s int, e Event, msg string) *Error {
 }
 
 type FSM struct {
-	sync.Locker
+	locker      sync.Locker
 	rwLocker    sync.RWMutex
 	flag        uint32
 	name        string
 	stateMap    map[int]*State
 	transitions []*Transition
 	current     int
+	queue       chan Event
 }
 
 func (f *FSM) String() string {
 	return fmt.Sprintf("FSM[%s]", f.name)
 }
 
-func (f *FSM) Event(e Event) error {
+func (f *FSM) Lock() {
+	f.locker.Lock()
+}
 
+func (f *FSM) Unlock() {
+	f.locker.Unlock()
+}
+
+func (f *FSM) LockEvent(e Event) error {
+	defer f.Unlock()
+	f.Lock()
+	return f.Event(e)
+}
+
+func (f *FSM) Event(e Event) error {
+	defer f.restoreFlag()
+	if f.setCheckFlag() {
+		return f.tryEnqueue(e)
+	}
+	if err := f.event(e); err != nil {
+		return err
+	}
+	for {
+		select {
+		case e := <-f.queue:
+			if err := f.event(e); err != nil {
+				f.dropEventInQueue()
+				return err
+			}
+		default:
+			return nil
+		}
+	}
+}
+
+func (f *FSM) event(e Event) error {
 	f.rwLocker.RLock()
 	current := f.current
 	t, ok := f.getTransition(e)
@@ -81,18 +113,6 @@ func (f *FSM) Event(e Event) error {
 	if !ok {
 		return makeError(f.String(), current, e, "event invalid in current state")
 	}
-
-	if f.setCheckFlag() {
-		err := makeError(f.String(), current, e, "fsm in transition")
-		if Debug {
-			panic(err)
-		} else {
-			log.Println(err.Error())
-		}
-		return err
-	}
-
-	defer f.restoreFlag()
 
 	next := t.Map[current]
 	c, n := f.stateMap[current], f.stateMap[next]
@@ -121,6 +141,25 @@ func (f *FSM) Event(e Event) error {
 	}
 
 	return nil
+}
+
+func (f *FSM) tryEnqueue(e Event) error {
+	select {
+	case f.queue <- e:
+		return nil
+	default:
+		return makeError(f.name, f.CurrentStateIndex(), e, "fsm event queue is full")
+	}
+}
+
+func (f *FSM) dropEventInQueue() {
+	for {
+		select {
+		case <-f.queue:
+		default:
+			return
+		}
+	}
 }
 
 func (f *FSM) setCheckFlag() bool {
@@ -161,6 +200,7 @@ func (f *FSM) getTransition(e Event) (t *Transition, ok bool) {
 type Builder struct {
 	err         error
 	name        string
+	queueSize   int
 	locker      sync.Locker
 	initState   *State
 	stateMap    map[int]*State
@@ -169,6 +209,7 @@ type Builder struct {
 
 func New() *Builder {
 	return &Builder{
+		queueSize:   12,
 		stateMap:    map[int]*State{},
 		transitions: []*Transition{},
 	}
@@ -179,6 +220,11 @@ func (b *Builder) Name(name string) *Builder {
 		return b
 	}
 	b.name = name
+	return b
+}
+
+func (b *Builder) QueueSize(size int) *Builder {
+	b.queueSize = size
 	return b
 }
 
@@ -244,15 +290,15 @@ func (b *Builder) Build() (*FSM, error) {
 		stateMap:    b.stateMap,
 		transitions: b.transitions,
 		current:     b.initState.Index,
+		queue:       make(chan Event, b.queueSize),
 	}
 	if f.name == "" {
 		f.name = fmt.Sprintf("%p", f)
 	}
-
-	if b.locker != nil {
-		f.Locker = b.locker
+	if b.locker == nil {
+		f.locker = &sync.Mutex{}
 	} else {
-		f.Locker = &sync.Mutex{}
+		f.locker = b.locker
 	}
 
 	return f, nil
